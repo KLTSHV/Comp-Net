@@ -10,6 +10,27 @@
 #include "message.hpp"
 #include "netio.hpp"
 
+
+
+struct Task {
+    int fd;
+    sockaddr_in addr;
+};
+struct Client{
+    int fd; 
+    sockaddr_in addr; 
+    std::string nick;
+    pthread_mutex_t send_mutex;
+    Client* next;
+};
+
+std::queue<Task> g_queue;
+pthread_mutex_t g_queue_mutex = PTHREAD_MUTEX_INITIALIZER;
+pthread_cond_t g_queue_not_empty = PTHREAD_COND_INITIALIZER;
+
+Client* g_clients = nullptr;
+pthread_mutex_t g_clients_mutex = PTHREAD_MUTEX_INITIALIZER;
+
 std::string addrToString(const sockaddr_in& a) {
     char ip[INET_ADDRSTRLEN];
     inet_ntop(AF_INET, &a.sin_addr, ip, sizeof(ip));
@@ -18,6 +39,7 @@ std::string addrToString(const sockaddr_in& a) {
 }
 
 bool recvMessage(int fd, Message& msg) {
+    
     uint32_t netLen = 0;
     uint8_t type = 0;
 
@@ -55,9 +77,142 @@ bool sendMessage(int fd, const Message& msg) {
     return true;
 }
 
+void queuePush(const Task& task){
+    pthread_mutex_lock(&g_queue_mutex);
+    g_queue.push(task);
+    pthread_cond_signal(&g_queue_not_empty);
+    pthread_mutex_unlock(&g_queue_mutex);
+}
+
+Task queuePop(){
+    pthread_mutex_lock(&g_queue_mutex);
+    while(g_queue.empty()){
+        pthread_cond_wait(&g_queue_not_empty, &g_queue_mutex);
+    }
+    Task task = g_queue.front();
+    g_queue.pop();
+    pthread_mutex_unlock(&g_queue_mutex);
+    return task;
+}
+Client* addClient(int fd, const sockaddr_in& addr, const std::string& nick){
+    Client* client = new Client;
+    client->fd = fd;
+    client->addr = addr;
+    client->nick = nick;
+    client->next = nullptr;
+    pthread_mutex_init(&client->send_mutex, nullptr);
+    pthread_mutex_lock(&g_clients_mutex);
+    client->next = g_clients;
+    g_clients = client;
+    pthread_mutex_unlock(&g_clients_mutex);
+    return client;
+}
+void removeClient(Client* client){
+    pthread_mutex_lock(&g_clients_mutex);
+    Client** cur = &g_clients;
+    while (*cur != nullptr){
+        if (*cur == client){
+            *cur = client->next;
+            break;
+        }
+        cur = &((*cur)->next);
+    }
+    pthread_mutex_unlock(&g_clients_mutex);
+    pthread_mutex_destroy(&client->send_mutex);
+    delete client;
+
+}
+void broadcastText(Client* sender, const std::string& text){
+    std::string peer = addrToString(sender->addr);
+    std::string fullText = sender->nick + " [" + peer +"]: " + text;
+    Message out{};
+    buildMessage(out, MSG_TEXT, fullText);
+    pthread_mutex_lock(&g_clients_mutex);
+
+    for(Client* cur = g_clients; cur != nullptr; cur = cur->next){
+        pthread_mutex_lock(&cur->send_mutex);
+        sendMessage(cur->fd, out);
+        pthread_mutex_unlock(&cur->send_mutex);
+    }
+    pthread_mutex_unlock(&g_clients_mutex);
+}
+void handleClient(int fd, const sockaddr_in& caddr) {
+    std::string peer = addrToString(caddr);
+    std::cout << "Client connected: " << peer << "\n";
+
+    Message msg{};
+    if (!recvMessage(fd, msg) || msg.type != MSG_HELLO) {
+        std::cerr << "Expected HELLO from " << peer << "\n";
+        ::close(fd);
+        return;
+    }
+
+    std::string nick = payloadToString(msg);
+    std::cout << "[" << peer << "]: " << nick << "\n";
+
+    Message welcome{};
+    buildMessage(welcome, MSG_WELCOME, "Welcome " + nick);
+
+    if (!sendMessage(fd, welcome)) {
+        std::cerr << "Failed to send WELCOME to " << peer << "\n";
+        ::close(fd);
+        return;
+    }
+
+    Client* self = addClient(fd, caddr, nick);
+
+    while (true) {
+        Message in{};
+        if (!recvMessage(fd, in)) {
+            std::cout << "Client disconnected: " << nick << " [" << peer << "]\n";
+            break;
+        }
+
+        if (in.type == MSG_TEXT) {
+            std::string text = payloadToString(in);
+            std::cout << nick << " [" << peer << "]: " << text << "\n";
+            broadcastText(self, text);
+        } else if (in.type == MSG_PING) {
+            Message pong{};
+            buildMessage(pong, MSG_PONG, "");
+
+            pthread_mutex_lock(&self->send_mutex);
+            bool ok = sendMessage(fd, pong);
+            pthread_mutex_unlock(&self->send_mutex);
+
+            if (!ok) {
+                std::cout << "Client disconnected: " << nick << " [" << peer << "]\n";
+                break;
+            }
+        } else if (in.type == MSG_BYE) {
+            std::cout << "Client disconnected: " << nick << " [" << peer << "]\n";
+            break;
+        } else {
+            std::cout << "Unknown message type from " << nick
+                      << " [" << peer << "]: " << int(in.type) << "\n";
+        }
+    }
+
+    removeClient(self);
+    ::close(fd);
+}
+
+void* workerThread(void* arg) {
+    (void)arg;
+
+    while (true) {
+        Task task = queuePop();
+        handleClient(task.fd, task.addr);
+    }
+
+    return nullptr;
+}
+
 int main(int argc, char** argv) {
     int port = 5555;
-    if (argc >= 2) port = std::stoi(argv[1]);
+    if (argc >= 2) {
+        port = std::stoi(argv[1]);
+    }
 
     int s = ::socket(AF_INET, SOCK_STREAM, 0);
     if (s < 0) {
@@ -79,74 +234,41 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    if (::listen(s, 1) < 0) {
+    if (::listen(s, 16) < 0) {
         perror("listen");
         ::close(s);
         return 1;
     }
 
+    pthread_t workers[10];
+    for (int i = 0; i < 10; ++i) {
+        if (pthread_create(&workers[i], nullptr, workerThread, nullptr) != 0) {
+            std::cerr << "pthread_create failed\n";
+            ::close(s);
+            return 1;
+        }
+        pthread_detach(workers[i]);
+    }
+
     std::cout << "Server listening on port " << port << "\n";
 
-    sockaddr_in caddr{};
-    socklen_t clen = sizeof(caddr);
-    int c = ::accept(s, (sockaddr*)&caddr, &clen);
-    if (c < 0) {
-        perror("accept");
-        ::close(s);
-        return 1;
-    }
-
-    std::string peer = addrToString(caddr);
-    std::cout << "Client connected\n";
-
-    //Получить MSG_HELLO
-    Message msg{};
-    if (!recvMessage(c, msg) || msg.type != MSG_HELLO) {
-        std::cerr << "Expected HELLO\n";
-        ::close(c);
-        ::close(s);
-        return 1;
-    }
-
-    std::string nick = payloadToString(msg);
-    std::cout << "[" << peer << "]: " << nick << "\n";
-
-    //Отправить MSG_WELCOME
-    Message welcome{};
-    buildMessage(welcome, MSG_WELCOME, "Welcome " + peer);
-    if (!sendMessage(c, welcome)) {
-        std::cerr << "Failed to send WELCOME\n";
-        ::close(c);
-        ::close(s);
-        return 1;
-    }
-
-    //Цикл обработки
     while (true) {
-        Message in{};
-        if (!recvMessage(c, in)) {
-            std::cout << "Client disconnected\n";
-            break;
+        sockaddr_in caddr{};
+        socklen_t clen = sizeof(caddr);
+
+        int c = ::accept(s, (sockaddr*)&caddr, &clen);
+        if (c < 0) {
+            perror("accept");
+            continue;
         }
 
-        if (in.type == MSG_TEXT) {
-            std::cout << "[" << peer << "]: " << payloadToString(in) << "\n";
-        } else if (in.type == MSG_PING) {
-            Message pong{};
-            buildMessage(pong, MSG_PONG, "");
-            if (!sendMessage(c, pong)) {
-                std::cout << "Client disconnected\n";
-                break;
-            }
-        } else if (in.type == MSG_BYE) {
-            std::cout << "Client disconnected\n";
-            break;
-        } else {
-            std::cout << "Unknown message type: " << int(in.type) << "\n";
-        }
+        Task task{};
+        task.fd = c;
+        task.addr = caddr;
+
+        queuePush(task);
     }
 
-    ::close(c);
     ::close(s);
     return 0;
 }
